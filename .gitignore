@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# 运行/测试输出
+out_*/
+spine_out/
+
+# 中间产物
+logo_256.png
+
+# See-through 样例素材(大体积二进制,非项目源码)
+20260623-100357-3/
+*_depth.psd
