@@ -295,15 +295,170 @@ def _write(skeleton, path):
           "slots:", len(skeleton["slots"]))
 
 
+# ---------------- 通用模式(任意 PSD)----------------
+# See-through 的结构性关键层;命中足够多则判定为 See-through 智能模式
+SEETHROUGH_SIGNATURE = {"face", "topwear", "handwear_l", "handwear_r",
+                        "footwear", "neck"}
+
+
+def _looks_seethrough(psd):
+    keys = set()
+    for layer in psd:
+        if not layer.is_group():
+            keys.add(slug(layer.name))
+    return len(SEETHROUGH_SIGNATURE & keys) >= 3
+
+
+GENERIC_MESH_GRID = 3   # generic-pro 每层网格的格数(cols=rows)
+
+
+def _grid_mesh(bbox, bone_xy, to_skel, n=GENERIC_MESH_GRID):
+    """把一张图层做成 n×n 网格(无权重),供 Spine 里自由网格形变 FFD。
+    顶点相对该层自己的骨骼(骨在层中心)。hull 在前、内部顶点在后。"""
+    l, t, r, b = bbox
+    w, h = r - l, b - t
+    bx, by = bone_xy
+
+    # 顶点 (col i, row j) 排序:先周边(顺时针一圈),再内部
+    order = []
+    for i in range(n + 1):      # 上边 左->右
+        order.append((i, 0))
+    for j in range(1, n + 1):   # 右边 上->下
+        order.append((n, j))
+    for i in range(n - 1, -1, -1):  # 下边 右->左
+        order.append((i, n))
+    for j in range(n - 1, 0, -1):   # 左边 下->上
+        order.append((0, j))
+    hull = len(order)
+    for j in range(1, n):       # 内部
+        for i in range(1, n):
+            order.append((i, j))
+    idx = {ij: k for k, ij in enumerate(order)}
+
+    uvs, verts = [], []
+    for i, j in order:
+        px, py = l + i / n * w, t + j / n * h
+        uvs += [round(i / n, 5), round(j / n, 5)]
+        sx, sy = to_skel(px, py)
+        verts += [round(sx - bx, 2), round(sy - by, 2)]   # 无权重:纯 x,y
+
+    tris = []
+    for j in range(n):
+        for i in range(n):
+            a, b2 = idx[(i, j)], idx[(i + 1, j)]
+            c, d = idx[(i + 1, j + 1)], idx[(i, j + 1)]
+            tris += [a, b2, c, a, c, d]
+
+    edges = []
+    for k in range(hull):
+        edges += [k * 2, ((k + 1) % hull) * 2]
+
+    return {"type": "mesh", "uvs": uvs, "triangles": tris, "vertices": verts,
+            "hull": hull, "edges": edges, "width": w, "height": h}
+
+
+def _generic_collect(psd, img_dir, to_skel):
+    """遍历一次:建骨架(每叶子层一根骨,组->层级)、导出 PNG、收集叶子记录。"""
+    os.makedirs(img_dir, exist_ok=True)
+    bones = [{"name": "root"}]
+    bone_abs = {"root": (0.0, 0.0)}   # root 在画布底部中心 -> (0,0)
+    used, leaves = set(), []
+
+    def uniq(name):
+        base = slug(name) or "layer"
+        k, i = base, 2
+        while k in used:
+            k = "%s_%d" % (base, i)
+            i += 1
+        used.add(k)
+        return k
+
+    def add_bone(name, parent, ax, ay):
+        pax, pay = bone_abs[parent]
+        bones.append({"name": name, "parent": parent,
+                      "x": round(ax - pax, 2), "y": round(ay - pay, 2)})
+        bone_abs[name] = (ax, ay)
+
+    def walk(container, parent_bone):
+        for layer in container:   # 自然顺序 = 底->顶 = 绘制顺序
+            bb = layer.bbox
+            if layer.is_group():
+                if bb == (0, 0, 0, 0):
+                    walk(layer, parent_bone)
+                    continue
+                key = uniq(layer.name)
+                add_bone(key, parent_bone, *to_skel(*center(bb)))
+                walk(layer, key)
+            else:
+                if bb == (0, 0, 0, 0):
+                    continue
+                key = uniq(layer.name)
+                layer.composite().save(os.path.join(img_dir, key + ".png"))
+                add_bone(key, parent_bone, *to_skel(*center(bb)))
+                leaves.append({"key": key, "bbox": bb})
+
+    walk(psd, "root")
+    return bones, bone_abs, leaves
+
+
+def _generic_skeleton(bones, bone_abs, leaves, W, H, cx, spine_version,
+                      professional, to_skel):
+    slots, atts = [], {}
+    for lf in leaves:
+        key, bb = lf["key"], lf["bbox"]
+        slots.append({"name": key, "bone": key, "attachment": key})
+        if professional:
+            atts[key] = {key: _grid_mesh(bb, bone_abs[key], to_skel)}
+        else:
+            l, t, r, b = bb
+            atts[key] = {key: {"x": 0, "y": 0,
+                               "width": r - l, "height": b - t}}
+    return {
+        "skeleton": {"spine": spine_version, "images": "./images/",
+                     "width": W, "height": H},
+        "bones": bones,
+        "slots": slots,
+        "skins": [{"name": "default", "attachments": atts}],
+    }
+
+
 def main(psd_path, out_dir, spine_version=DEFAULT_SPINE_VERSION,
-         profile=DEFAULT_PROFILE):
+         profile=DEFAULT_PROFILE, mode="auto"):
     psd = PSDImage.open(psd_path)
     W, H = psd.width, psd.height
     cx = W / 2.0
-    layers, bboxes = _export_layers(psd, os.path.join(out_dir, "images"))
-    print("spine version:", spine_version, "| images:", len(layers),
-          "| profile:", profile)
+    img_dir = os.path.join(out_dir, "images")
 
+    if mode == "auto":
+        mode = "seethrough" if _looks_seethrough(psd) else "generic"
+
+    # 通用模式:任意 PSD,逐层一根骨。essential=region;professional=每层网格(FFD,无权重)
+    if mode == "generic":
+        def to_skel(px, py):
+            return (px - cx, H - py)
+        bones, bone_abs, leaves = _generic_collect(psd, img_dir, to_skel)
+        print("spine version:", spine_version, "| images:", len(leaves),
+              "| mode: generic | profile:", profile)
+        want_ess = profile in ("essential", "both")
+        want_pro = profile in ("professional", "both")
+        if want_ess:
+            ess = _generic_skeleton(bones, bone_abs, leaves, W, H, cx,
+                                    spine_version, False, to_skel)
+            _write(ess, os.path.join(
+                out_dir, "skeleton_essential.json" if profile == "both"
+                else "skeleton.json"))
+        if want_pro:
+            pro = _generic_skeleton(bones, bone_abs, leaves, W, H, cx,
+                                    spine_version, True, to_skel)
+            _write(pro, os.path.join(
+                out_dir, "skeleton_professional.json" if profile == "both"
+                else "skeleton.json"))
+        return out_dir
+
+    # See-through 智能模式
+    layers, bboxes = _export_layers(psd, img_dir)
+    print("spine version:", spine_version, "| images:", len(layers),
+          "| mode: seethrough | profile:", profile)
     want_ess = profile in ("essential", "both")
     want_pro = profile in ("professional", "both")
     if want_ess:
@@ -331,7 +486,7 @@ def find_psds(in_dir):
 
 
 def batch(in_dir, out_root, spine_version=DEFAULT_SPINE_VERSION,
-          profile=DEFAULT_PROFILE):
+          profile=DEFAULT_PROFILE, mode="auto"):
     """批处理:in_dir 下所有 PSD,各自输出到 out_root/<相对路径(去扩展名)>/。"""
     psds = find_psds(in_dir)
     if not psds:
@@ -344,7 +499,7 @@ def batch(in_dir, out_root, spine_version=DEFAULT_SPINE_VERSION,
         out = os.path.join(out_root, rel)
         print("\n[%d/%d] %s" % (i, len(psds), p))
         try:
-            main(p, out, spine_version, profile)
+            main(p, out, spine_version, profile, mode)
             done.append(out)
         except Exception as e:
             print("  [skip] 出错:", e)
@@ -360,11 +515,14 @@ if __name__ == "__main__":
                     help="目标 Spine 版本号,如 4.3.17;不填则自动探测")
     ap.add_argument("--profile", default=DEFAULT_PROFILE,
                     choices=["essential", "professional", "both"],
-                    help="输出版本:essential / professional / both(默认)")
+                    help="输出版本(仅 See-through 模式):essential/professional/both")
+    ap.add_argument("--mode", default="auto",
+                    choices=["auto", "seethrough", "generic"],
+                    help="auto(默认,自动判别)/seethrough(智能人形)/generic(通用,任意PSD逐层一根骨)")
     args = ap.parse_args()
 
     ver = resolve_spine_version(args.spine_version)
     if os.path.isdir(args.psd):
-        batch(args.psd, args.out_dir, ver, args.profile)
+        batch(args.psd, args.out_dir, ver, args.profile, args.mode)
     else:
-        main(args.psd, args.out_dir, ver, args.profile)
+        main(args.psd, args.out_dir, ver, args.profile, args.mode)

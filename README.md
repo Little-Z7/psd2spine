@@ -35,6 +35,11 @@ python psd2spine.py <输入目录> <输出根目录> --profile both
 ```
 `--profile` 取值:`essential`(刚性 region)/ `professional`(mesh+权重,可弯)/ `both`(默认)。
 
+`--mode` 取值:
+- `auto`(默认):自动判别 —— 命中 See-through 结构则走智能人形,否则走通用;
+- `seethrough`:See-through 智能人形骨架(命名/结构需符合 See-through 输出);
+- `generic`:**通用模式,支持任意 PSD** —— 每个图层一根骨 + slot,组→骨层级,重名自动去重,绘制顺序按图层顺序。导入即得逐层可动的基础骨架,再在 Spine 里整理层级。
+
 ### 打包成单 exe(分发)
 ```
 pip install -r requirements.txt pyinstaller
@@ -51,5 +56,6 @@ build_exe.bat
 - [x] Essential 版:8 根人形骨架 + slot + region 附件,导入即为组装好的角色。
 - [x] Professional 版:为四肢/躯干生成条带网格 + 双骨距离权重(可弯),关节在 Spine 里手调。
 - [x] 批处理整个 See-through 输出目录(`--profile both` 各出两套)。
+- [x] 通用模式:任意 PSD 逐层一根骨 + 组→骨层级 + 重名去重,GUI 自动判别。
 - [x] GUI(pywebview)+ PS 插件(JSX)均支持版本/profile/批量,带 logo。
 - [ ] 可选:利用 `_depth.psd` 做 2.5D 视差/转头(深度为层内自归一化,仅适合伪 3D,非 2D 必需)。
