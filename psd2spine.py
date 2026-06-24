@@ -227,8 +227,16 @@ def _strip_mesh(rec, chain, bone_idx, bone_abs, to_skel, rows=MESH_ROWS):
         ri, ri1 = last - i, last - (i + 1)
         tris += [a, b2, ri1, a, ri1, ri]
 
+    # hull 边(Spine 边索引 = 顶点序号 * 2);3.8 解析器要求 mesh 带 edges
+    n = len(pts)
+    edges = []
+    for i in range(n):
+        j = (i + 1) % n
+        edges += [i * 2, j * 2]
+
     return {"type": "mesh", "uvs": uvs, "triangles": tris,
-            "vertices": verts, "hull": len(pts), "width": w, "height": h}
+            "vertices": verts, "hull": n, "edges": edges,
+            "width": w, "height": h}
 
 
 def _build_skeleton(layers, bboxes, W, H, cx, spine_version, professional):
@@ -276,7 +284,7 @@ def _build_skeleton(layers, bboxes, W, H, cx, spine_version, professional):
         "bones": bones,
         "slots": slots,
         "skins": [{"name": "default", "attachments": attachments}],
-        "animations": {"setup": {}},
+        # 不写空动画:3.8 解析器会拒绝无时间轴的空动画;动画留给用户在 Spine 里建
     }
 
 

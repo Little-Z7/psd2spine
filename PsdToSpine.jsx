@@ -118,8 +118,11 @@ function stripMesh(rec, chain, boneIdx, boneAbs, W,H,cx){
     }
     var tris=[], last=2*R+1;
     for(i=0;i<R;i++){ var ri=last-i, ri1=last-(i+1); tris.push(i,i+1,ri1,i,ri1,ri); }
+    var n=pts.length, edges=[];   // 3.8 解析器要求 mesh 带 edges(索引=顶点序号*2)
+    for(i=0;i<n;i++){ var j=(i+1)%n; edges.push(i*2, j*2); }
     return '{"type":"mesh","uvs":['+uvs.join(",")+'],"triangles":['+tris.join(",")+
-           '],"vertices":['+verts.join(",")+'],"hull":'+pts.length+',"width":'+w+',"height":'+h+'}';
+           '],"vertices":['+verts.join(",")+'],"hull":'+n+',"edges":['+edges.join(",")+
+           '],"width":'+w+',"height":'+h+'}';
 }
 
 // ---------- 构建 skeleton JSON ----------
@@ -147,7 +150,7 @@ function buildSkeleton(recs, bb, W,H,cx, ver, professional){
     }
     return '{\n"skeleton":{"spine":"'+ver+'","images":"./images/","width":'+W+',"height":'+H+'},\n'+
            '"bones":['+bones.join(",")+'],\n"slots":['+slots.join(",")+'],\n'+
-           '"skins":[{"name":"default","attachments":{'+atts.join(",")+'}}],\n"animations":{"setup":{}}\n}';
+           '"skins":[{"name":"default","attachments":{'+atts.join(",")+'}}]\n}';
 }
 
 function writeJson(outDir, name, txt){ var f=File(outDir.fsName+"/"+name);
