@@ -12,9 +12,15 @@ dist/
 out_*/
 spine_out/
 
-# 中间产物
+# 中间产物 / 调试可视化
 logo_256.png
+yang_*.png
+*_recognized_bones.png
+*_ai_input.png
 
 # 样例素材(大体积二进制,非项目源码)
 20260623-100357-3/
 *.psd
+
+# ML 姿态模型(30MB,从 Google 下载,见 README;exe 内已打包)
+*.task

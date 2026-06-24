@@ -67,7 +67,21 @@ HTML = r"""
   </div>
 
   <div class="row">
-    <label>输出版本</label>
+    <label>识别模式</label>
+    <div class="field">
+      <select id="mode" style="flex:1;background:var(--panel);color:var(--fg);
+              border:1px solid #353c4a;padding:8px;border-radius:6px;">
+        <option value="auto">自动判别(推荐)</option>
+        <option value="smart">智能融合(姿态 + 图层名,补全骨架)</option>
+        <option value="ml">纯姿态绑骨(只靠 AI 识别)</option>
+        <option value="seethrough">See-through 智能人形</option>
+        <option value="generic">通用(任意PSD,逐层一根骨)</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="row">
+    <label>输出版本(ML 模式忽略)</label>
     <div class="field">
       <select id="profile" style="flex:1;background:var(--panel);color:var(--fg);
               border:1px solid #353c4a;padding:8px;border-radius:6px;">
@@ -93,6 +107,25 @@ HTML = r"""
       <button onclick="redetect()">重新探测</button>
     </div>
     <div class="hint">探测不到时请手填,使其与你的 Spine 版本一致以消除导入警告。</div>
+  </div>
+
+  <div class="row">
+    <label style="cursor:pointer;">
+      <input type="checkbox" id="aion" onchange="document.getElementById('aibox').style.display=this.checked?'block':'none'">
+      启用 AI 视觉增强(smart 模式下,用视觉大模型补全部位识别)
+    </label>
+    <div id="aibox" style="display:none;margin-top:6px;">
+      <div class="field" style="margin-bottom:6px;">
+        <input id="aiurl" type="text" placeholder="Base URL,如 https://api.openai.com/v1">
+      </div>
+      <div class="field" style="margin-bottom:6px;">
+        <input id="aikey" type="text" placeholder="API Key">
+      </div>
+      <div class="field">
+        <input id="aimodel" type="text" placeholder="模型 id,如 gpt-4o">
+      </div>
+      <div class="hint">OpenAI 兼容接口;仅 smart 模式生效,失败会自动忽略只用本地融合。</div>
+    </div>
   </div>
 
   <button class="primary" id="run" onclick="run()">生成 Spine 工程</button>
@@ -131,8 +164,13 @@ HTML = r"""
   async function run(){
     const btn=document.getElementById('run'); btn.disabled=true;
     log('\n开始生成…\n');
+    let ai = null;
+    if(document.getElementById('aion').checked){
+      ai = {base_url: val('aiurl'), api_key: val('aikey'), model: val('aimodel')};
+    }
     const r = await pywebview.api.generate(val('psd'), val('out'), val('ver'),
-        document.getElementById('profile').value, isBatch());
+        document.getElementById('profile').value, isBatch(),
+        document.getElementById('mode').value, ai);
     log(r.log);
     log(r.ok ? ('\n✅ 完成 -> '+r.out+'\n') : ('\n❌ 失败\n'));
     btn.disabled=false;
@@ -170,12 +208,20 @@ class Api:
     def detect(self):
         return psd2spine.detect_spine_version() or ""
 
-    def generate(self, psd, out, ver, profile="both", batch=False):
+    def generate(self, psd, out, ver, profile="both", batch=False,
+                 mode="auto", ai=None):
         ver = ((ver or "").strip()
                or psd2spine.detect_spine_version()
                or psd2spine.DEFAULT_SPINE_VERSION)
         if profile not in ("essential", "professional", "both"):
             profile = "both"
+        if mode not in ("auto", "seethrough", "generic", "ml", "smart"):
+            mode = "auto"
+        ai_cfg = None
+        if ai and ai.get("base_url") and ai.get("api_key") and ai.get("model"):
+            ai_cfg = {"base_url": ai["base_url"].strip(),
+                      "api_key": ai["api_key"].strip(),
+                      "model": ai["model"].strip()}
         if not psd or not os.path.exists(psd):
             return {"ok": False, "log": "错误:请选择有效的输入\n", "out": ""}
         if batch and not os.path.isdir(psd):
@@ -191,9 +237,9 @@ class Api:
         try:
             with redirect_stdout(buf):
                 if batch:
-                    psd2spine.batch(psd, out, ver, profile)
+                    psd2spine.batch(psd, out, ver, profile, mode, ai_cfg)
                 else:
-                    psd2spine.main(psd, out, ver, profile)
+                    psd2spine.main(psd, out, ver, profile, mode, ai_cfg)
             return {"ok": True, "log": buf.getvalue(), "out": out}
         except Exception:
             return {"ok": False,

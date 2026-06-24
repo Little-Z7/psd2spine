@@ -1,2 +1,5 @@
 psd-tools
 pywebview
+numpy
+Pillow
+mediapipe   ; ml / smart 模式需要(配合 pose_landmarker.task 模型)

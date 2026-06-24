@@ -12,8 +12,17 @@ import os
 import re
 import sys
 import json
+import math
 import argparse
+import numpy as np
 from psd_tools import PSDImage
+
+
+def _rot(vx, vy, deg):
+    """把向量 (vx,vy) 旋转 deg 度。"""
+    r = math.radians(deg)
+    c, s = math.cos(r), math.sin(r)
+    return (vx * c - vy * s, vx * s + vy * c)
 
 DEFAULT_SPINE_VERSION = "4.2.00"
 
@@ -119,7 +128,7 @@ DEFORM_CHAINS = {
     "handwear_r": ["arm-r", "arm-r-2"],
     "topwear": ["torso", "hip"],
 }
-MESH_ROWS = 6  # 网格沿主轴的分段数(越大越平滑、可弯)
+MESH_ROWS = 10  # 网格沿主轴的分段数(越大越平滑、越贴合剪影)
 DEFAULT_PROFILE = "both"
 
 
@@ -136,11 +145,27 @@ def _export_layers(psd, img_dir):
         if layer.bbox == (0, 0, 0, 0):
             continue
         key = slug(layer.name)
-        layer.composite().save(os.path.join(img_dir, key + ".png"))
+        png = layer.composite()
+        png.save(os.path.join(img_dir, key + ".png"))
         l, t, r, b = layer.bbox
-        layers.append({"key": key, "bbox": layer.bbox, "w": r - l, "h": b - t})
+        alpha = np.asarray(png.convert("RGBA"))[..., 3] > 10  # 不透明像素掩码
+        layers.append({"key": key, "bbox": layer.bbox, "w": r - l, "h": b - t,
+                       "alpha": alpha})
         bboxes[key] = layer.bbox
     return layers, bboxes
+
+
+def _row_extent(mask, frac):
+    """取掩码第 frac(0~1)行的最左/最右不透明列;空行向邻近行搜索。"""
+    h, w = mask.shape
+    ri = max(0, min(h - 1, int(round(frac * (h - 1)))))
+    for d in range(h):
+        for rr in (ri - d, ri + d):
+            if 0 <= rr < h:
+                cols = np.nonzero(mask[rr])[0]
+                if cols.size:
+                    return int(cols[0]), int(cols[-1])
+    return 0, w - 1
 
 
 def _bone_anchors(bboxes, W, H, cx, professional):
@@ -193,7 +218,8 @@ def _bone_anchors(bboxes, W, H, cx, professional):
     return bone_psd, order, parent
 
 
-def _strip_mesh(rec, chain, bone_idx, bone_abs, to_skel, rows=MESH_ROWS):
+def _strip_mesh(rec, chain, bone_idx, bone_abs, world_rot, to_skel,
+                rows=MESH_ROWS):
     """为可形变层生成沿垂直方向的条带网格 + 双骨距离权重(可弯,关节后续手调)。"""
     l, t, r, b = rec["bbox"]
     w, h = rec["w"], rec["h"]
@@ -201,24 +227,32 @@ def _strip_mesh(rec, chain, bone_idx, bone_abs, to_skel, rows=MESH_ROWS):
     Tx, Ty = bone_abs[T]
     Bx, By = bone_abs[B]
     iT, iB = bone_idx[T], bone_idx[B]
+    rT, rB = world_rot[T], world_rot[B]   # 各骨朝向,顶点局部坐标需反向旋转
 
-    # 周边顶点:左列 上->下,右列 下->上(全部在凸包上,hull=全部)
-    pts = [(l, t + i / rows * h) for i in range(rows + 1)]
-    pts += [(r, b - i / rows * h) for i in range(rows + 1)]
+    # 周边顶点:左右列按每行真实剪影(最左/最右不透明像素)走,贴合边缘
+    mask = rec.get("alpha")
+    if mask is not None and mask.any():
+        exts = [_row_extent(mask, i / rows) for i in range(rows + 1)]
+    else:
+        exts = [(0, w - 1) for _ in range(rows + 1)]   # 兜底:矩形
+    pts = [(l + exts[i][0], t + i / rows * h) for i in range(rows + 1)]
+    pts += [(l + exts[rows - i][1], b - i / rows * h) for i in range(rows + 1)]
 
     uvs, verts = [], []
     for px, py in pts:
         uvs += [round((px - l) / w, 5), round((py - t) / h, 5)]
         sx, sy = to_skel(px, py)
+        lTx, lTy = _rot(sx - Tx, sy - Ty, -rT)
+        lBx, lBy = _rot(sx - Bx, sy - By, -rB)
         tw = 0.5 if Ty == By else max(0.0, min(1.0, (Ty - sy) / (Ty - By)))
         wB, wT = tw, 1.0 - tw
         if wT < 0.001:
-            verts += [1, iB, round(sx - Bx, 2), round(sy - By, 2), 1]
+            verts += [1, iB, round(lBx, 2), round(lBy, 2), 1]
         elif wB < 0.001:
-            verts += [1, iT, round(sx - Tx, 2), round(sy - Ty, 2), 1]
+            verts += [1, iT, round(lTx, 2), round(lTy, 2), 1]
         else:
-            verts += [2, iT, round(sx - Tx, 2), round(sy - Ty, 2), round(wT, 4),
-                      iB, round(sx - Bx, 2), round(sy - By, 2), round(wB, 4)]
+            verts += [2, iT, round(lTx, 2), round(lTy, 2), round(wT, 4),
+                      iB, round(lBx, 2), round(lBy, 2), round(wB, 4)]
 
     tris = []
     last = 2 * rows + 1
@@ -239,6 +273,63 @@ def _strip_mesh(rec, chain, bone_idx, bone_abs, to_skel, rows=MESH_ROWS):
             "width": w, "height": h}
 
 
+# 人形骨架延续主链的"主子骨"(用于给骨头定朝向);其余为末端骨
+PRIMARY_CHILD = {"hip": "torso", "torso": "neck", "neck": "head"}
+
+
+def _bone_orient(order, parent, bone_abs, bboxes, cx, H, professional):
+    """给每根骨计算世界朝向(度)与长度,使其指向子骨/肢体末端,显示成连贯骨架。
+    root 保持 0 长度、0 旋转作为原点。"""
+    def to_skel(px, py):
+        return (px - cx, H - py)
+
+    pc = dict(PRIMARY_CHILD)
+    if professional:
+        if "arm-l-2" in bone_abs:
+            pc["arm-l"] = "arm-l-2"
+        if "arm-r-2" in bone_abs:
+            pc["arm-r"] = "arm-r-2"
+
+    hl, hr = bboxes.get("handwear_l"), bboxes.get("handwear_r")
+    foot = bboxes.get("footwear")
+    # 末端骨的几何目标点(世界坐标)
+    head_tip_y = min([bboxes[k][1] for k in ("headwear", "face", "back_hair")
+                      if k in bboxes] or [bone_abs["head"][1]])
+
+    def leaf_target(name):
+        if name == "head":
+            return to_skel(bone_abs["head"][0] + cx, head_tip_y)
+        if name == "arm-l" and hl:
+            return to_skel((hl[0] + hl[2]) / 2.0, hl[3])
+        if name == "arm-r" and hr:
+            return to_skel((hr[0] + hr[2]) / 2.0, hr[3])
+        if name == "arm-l-2" and hl:
+            return to_skel((hl[0] + hl[2]) / 2.0, hl[3] + (hl[3] - hl[1]) * 0.3)
+        if name == "arm-r-2" and hr:
+            return to_skel((hr[0] + hr[2]) / 2.0, hr[3] + (hr[3] - hr[1]) * 0.3)
+        if name == "foot" and foot:
+            return to_skel((foot[0] + foot[2]) / 2.0, foot[3])
+        bx, by = bone_abs[name]      # 兜底:向下默认一截
+        return (bx, by - 50)
+
+    world_rot, length = {"root": 0.0}, {"root": 0.0}
+    for name in order:
+        if name == "root":
+            continue
+        bx, by = bone_abs[name]
+        tgt = bone_abs[pc[name]] if name in pc and pc[name] in bone_abs \
+            else leaf_target(name)
+        dx, dy = tgt[0] - bx, tgt[1] - by
+        dist = math.hypot(dx, dy)
+        if dist < 1e-3:
+            world_rot[name] = world_rot.get(parent[name], 0.0)
+            length[name] = 40.0
+        else:
+            world_rot[name] = math.degrees(math.atan2(dy, dx))
+            length[name] = round(dist, 2)
+    return world_rot, length
+
+
 def _build_skeleton(layers, bboxes, W, H, cx, spine_version, professional):
     bone_psd, order, parent = _bone_anchors(bboxes, W, H, cx, professional)
 
@@ -247,6 +338,8 @@ def _build_skeleton(layers, bboxes, W, H, cx, spine_version, professional):
 
     bone_abs = {k: to_skel(*v) for k, v in bone_psd.items()}
     bone_idx = {name: i for i, name in enumerate(order)}
+    world_rot, length = _bone_orient(order, parent, bone_abs, bboxes,
+                                     cx, H, professional)
 
     bones = []
     for name in order:
@@ -256,8 +349,14 @@ def _build_skeleton(layers, bboxes, W, H, cx, spine_version, professional):
         if p:
             e["parent"] = p
             pax, pay = bone_abs[p]
-            e["x"] = round(ax - pax, 2)
-            e["y"] = round(ay - pay, 2)
+            # 子骨局部坐标 = 在父骨(已旋转)坐标系中的位置
+            lx, ly = _rot(ax - pax, ay - pay, -world_rot[p])
+            e["x"], e["y"] = round(lx, 2), round(ly, 2)
+            lrot = world_rot[name] - world_rot[p]
+            if abs(lrot) > 1e-4:
+                e["rotation"] = round(lrot, 2)
+        if length.get(name):
+            e["length"] = length[name]
         bones.append(e)
 
     slots, attachments = [], {}
@@ -267,15 +366,20 @@ def _build_skeleton(layers, bboxes, W, H, cx, spine_version, professional):
         if chain and all(b in bone_idx for b in chain):
             bone = chain[0]
             attachments[key] = {key: _strip_mesh(lay, chain, bone_idx,
-                                                  bone_abs, to_skel)}
+                                                  bone_abs, world_rot, to_skel)}
         else:
             bone = LAYER_TO_BONE.get(key, "root")
             ccx, ccy = center(lay["bbox"])
             sx, sy = to_skel(ccx, ccy)
             bax, bay = bone_abs[bone]
-            attachments[key] = {key: {
-                "x": round(sx - bax, 2), "y": round(sy - bay, 2),
-                "width": lay["w"], "height": lay["h"]}}
+            wr = world_rot[bone]
+            # 旋转补偿:偏移按 -骨朝向旋转,附件加 -骨朝向 使图片保持正立
+            lx, ly = _rot(sx - bax, sy - bay, -wr)
+            att = {"x": round(lx, 2), "y": round(ly, 2),
+                   "width": lay["w"], "height": lay["h"]}
+            if abs(wr) > 1e-4:
+                att["rotation"] = round(-wr, 2)
+            attachments[key] = {key: att}
         slots.append({"name": key, "bone": bone, "attachment": key})
 
     return {
@@ -312,9 +416,9 @@ def _looks_seethrough(psd):
 GENERIC_MESH_GRID = 3   # generic-pro 每层网格的格数(cols=rows)
 
 
-def _grid_mesh(bbox, bone_xy, to_skel, n=GENERIC_MESH_GRID):
+def _grid_mesh(bbox, bone_xy, to_skel, wrot=0.0, n=GENERIC_MESH_GRID):
     """把一张图层做成 n×n 网格(无权重),供 Spine 里自由网格形变 FFD。
-    顶点相对该层自己的骨骼(骨在层中心)。hull 在前、内部顶点在后。"""
+    顶点相对该层自己的骨骼(骨在层中心,朝向 wrot,顶点需反向旋转)。"""
     l, t, r, b = bbox
     w, h = r - l, b - t
     bx, by = bone_xy
@@ -340,7 +444,8 @@ def _grid_mesh(bbox, bone_xy, to_skel, n=GENERIC_MESH_GRID):
         px, py = l + i / n * w, t + j / n * h
         uvs += [round(i / n, 5), round(j / n, 5)]
         sx, sy = to_skel(px, py)
-        verts += [round(sx - bx, 2), round(sy - by, 2)]   # 无权重:纯 x,y
+        lx, ly = _rot(sx - bx, sy - by, -wrot)   # 反向旋转到骨局部
+        verts += [round(lx, 2), round(ly, 2)]
 
     tris = []
     for j in range(n):
@@ -362,6 +467,7 @@ def _generic_collect(psd, img_dir, to_skel):
     os.makedirs(img_dir, exist_ok=True)
     bones = [{"name": "root"}]
     bone_abs = {"root": (0.0, 0.0)}   # root 在画布底部中心 -> (0,0)
+    world_rot = {"root": 0.0}
     used, leaves = set(), []
 
     def uniq(name):
@@ -373,11 +479,17 @@ def _generic_collect(psd, img_dir, to_skel):
         used.add(k)
         return k
 
-    def add_bone(name, parent, ax, ay):
+    def add_bone(name, parent, ax, ay, wrot=0.0, wlen=0.0):
         pax, pay = bone_abs[parent]
-        bones.append({"name": name, "parent": parent,
-                      "x": round(ax - pax, 2), "y": round(ay - pay, 2)})
+        e = {"name": name, "parent": parent,
+             "x": round(ax - pax, 2), "y": round(ay - pay, 2)}
+        if abs(wrot) > 1e-4:      # 父骨 rotation=0,故局部旋转=世界旋转
+            e["rotation"] = round(wrot, 2)
+        if wlen:
+            e["length"] = round(wlen, 2)
+        bones.append(e)
         bone_abs[name] = (ax, ay)
+        world_rot[name] = wrot
 
     def walk(container, parent_bone):
         for layer in container:   # 自然顺序 = 底->顶 = 绘制顺序
@@ -394,25 +506,33 @@ def _generic_collect(psd, img_dir, to_skel):
                     continue
                 key = uniq(layer.name)
                 layer.composite().save(os.path.join(img_dir, key + ".png"))
-                add_bone(key, parent_bone, *to_skel(*center(bb)))
+                l, t, r, b = bb
+                lw, lh = r - l, b - t
+                # 可见骨:沿图层长边,长度取长边一半
+                wrot = 90.0 if lh >= lw else 0.0
+                add_bone(key, parent_bone, *to_skel(*center(bb)),
+                         wrot=wrot, wlen=0.5 * max(lw, lh))
                 leaves.append({"key": key, "bbox": bb})
 
     walk(psd, "root")
-    return bones, bone_abs, leaves
+    return bones, bone_abs, leaves, world_rot
 
 
-def _generic_skeleton(bones, bone_abs, leaves, W, H, cx, spine_version,
-                      professional, to_skel):
+def _generic_skeleton(bones, bone_abs, leaves, world_rot, W, H, cx,
+                      spine_version, professional, to_skel):
     slots, atts = [], {}
     for lf in leaves:
         key, bb = lf["key"], lf["bbox"]
+        wr = world_rot.get(key, 0.0)
         slots.append({"name": key, "bone": key, "attachment": key})
         if professional:
-            atts[key] = {key: _grid_mesh(bb, bone_abs[key], to_skel)}
+            atts[key] = {key: _grid_mesh(bb, bone_abs[key], to_skel, wr)}
         else:
             l, t, r, b = bb
-            atts[key] = {key: {"x": 0, "y": 0,
-                               "width": r - l, "height": b - t}}
+            att = {"x": 0, "y": 0, "width": r - l, "height": b - t}
+            if abs(wr) > 1e-4:    # 骨已旋转,附件反向旋转保持图片正立
+                att["rotation"] = round(-wr, 2)
+            atts[key] = {key: att}
     return {
         "skeleton": {"spine": spine_version, "images": "./images/",
                      "width": W, "height": H},
@@ -423,33 +543,58 @@ def _generic_skeleton(bones, bone_abs, leaves, W, H, cx, spine_version,
 
 
 def main(psd_path, out_dir, spine_version=DEFAULT_SPINE_VERSION,
-         profile=DEFAULT_PROFILE, mode="auto"):
+         profile=DEFAULT_PROFILE, mode="auto", ai_cfg=None):
     psd = PSDImage.open(psd_path)
     W, H = psd.width, psd.height
     cx = W / 2.0
     img_dir = os.path.join(out_dir, "images")
 
+    # auto:命中 See-through 结构走智能人形;否则走 smart(ML+名字融合),失败回退通用
+    auto_fallback = False
     if mode == "auto":
-        mode = "seethrough" if _looks_seethrough(psd) else "generic"
+        if _looks_seethrough(psd):
+            mode = "seethrough"
+        else:
+            mode, auto_fallback = "smart", True
+
+    # ML / smart 绑骨:关节识别 -> 人形骨架 -> 图层分配
+    if mode in ("ml", "smart"):
+        try:
+            import ml_rig
+            if mode == "smart":
+                skel = ml_rig.build_smart_skeleton(psd, img_dir, W, H, cx,
+                                                   spine_version, ai_cfg)
+            else:
+                skel = ml_rig.build_ml_skeleton(psd, img_dir, W, H, cx,
+                                                spine_version)
+            print("spine version:", spine_version, "| mode:", mode)
+            _write(skel, os.path.join(out_dir, "skeleton.json"))
+            return out_dir
+        except Exception as e:
+            if not auto_fallback:
+                raise        # 显式指定模式失败则报错
+            print("[%s] 失败,回退通用模式:%s" % (mode, e))
+            mode = "generic"
 
     # 通用模式:任意 PSD,逐层一根骨。essential=region;professional=每层网格(FFD,无权重)
     if mode == "generic":
         def to_skel(px, py):
             return (px - cx, H - py)
-        bones, bone_abs, leaves = _generic_collect(psd, img_dir, to_skel)
+        bones, bone_abs, leaves, world_rot = _generic_collect(
+            psd, img_dir, to_skel)
         print("spine version:", spine_version, "| images:", len(leaves),
               "| mode: generic | profile:", profile)
         want_ess = profile in ("essential", "both")
         want_pro = profile in ("professional", "both")
         if want_ess:
-            ess = _generic_skeleton(bones, bone_abs, leaves, W, H, cx,
-                                    spine_version, False, to_skel)
+            ess = _generic_skeleton(bones, bone_abs, leaves, world_rot,
+                                    W, H, cx, spine_version, False, to_skel)
             _write(ess, os.path.join(
                 out_dir, "skeleton_essential.json" if profile == "both"
                 else "skeleton.json"))
         if want_pro:
-            pro = _generic_skeleton(bones, bone_abs, leaves, W, H, cx,
-                                    spine_version, True, to_skel)
+            pro = _generic_skeleton(bones, bone_abs, leaves, world_rot,
+                                    W, H, cx, spine_version, True, to_skel)
             _write(pro, os.path.join(
                 out_dir, "skeleton_professional.json" if profile == "both"
                 else "skeleton.json"))
@@ -486,7 +631,7 @@ def find_psds(in_dir):
 
 
 def batch(in_dir, out_root, spine_version=DEFAULT_SPINE_VERSION,
-          profile=DEFAULT_PROFILE, mode="auto"):
+          profile=DEFAULT_PROFILE, mode="auto", ai_cfg=None):
     """批处理:in_dir 下所有 PSD,各自输出到 out_root/<相对路径(去扩展名)>/。"""
     psds = find_psds(in_dir)
     if not psds:
@@ -499,7 +644,7 @@ def batch(in_dir, out_root, spine_version=DEFAULT_SPINE_VERSION,
         out = os.path.join(out_root, rel)
         print("\n[%d/%d] %s" % (i, len(psds), p))
         try:
-            main(p, out, spine_version, profile, mode)
+            main(p, out, spine_version, profile, mode, ai_cfg)
             done.append(out)
         except Exception as e:
             print("  [skip] 出错:", e)
@@ -517,12 +662,19 @@ if __name__ == "__main__":
                     choices=["essential", "professional", "both"],
                     help="输出版本(仅 See-through 模式):essential/professional/both")
     ap.add_argument("--mode", default="auto",
-                    choices=["auto", "seethrough", "generic"],
-                    help="auto(默认,自动判别)/seethrough(智能人形)/generic(通用,任意PSD逐层一根骨)")
+                    choices=["auto", "seethrough", "generic", "ml", "smart"],
+                    help="auto/seethrough/generic/ml(纯姿态)/smart(姿态+图层名融合)")
+    ap.add_argument("--ai-base-url", default=None, help="AI 视觉:OpenAI 兼容 base_url")
+    ap.add_argument("--ai-key", default=None, help="AI 视觉:API key")
+    ap.add_argument("--ai-model", default=None, help="AI 视觉:模型 id")
     args = ap.parse_args()
 
     ver = resolve_spine_version(args.spine_version)
+    ai_cfg = None
+    if args.ai_base_url and args.ai_key and args.ai_model:
+        ai_cfg = {"base_url": args.ai_base_url, "api_key": args.ai_key,
+                  "model": args.ai_model}
     if os.path.isdir(args.psd):
-        batch(args.psd, args.out_dir, ver, args.profile, args.mode)
+        batch(args.psd, args.out_dir, ver, args.profile, args.mode, ai_cfg)
     else:
-        main(args.psd, args.out_dir, ver, args.profile, args.mode)
+        main(args.psd, args.out_dir, ver, args.profile, args.mode, ai_cfg)
