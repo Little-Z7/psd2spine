@@ -1,0 +1,13 @@
+name: Plane sync
+on:
+  push:
+    branches: ["**"]
+jobs:
+  sync:
+    uses: Little-Z7/plane-sync/.github/workflows/sync.yml@main
+    with:
+      project_id: ${{ vars.PLANE_PROJECT_ID }}
+      prefix: ${{ vars.PLANE_PROJECT_PREFIX }}
+      slug: ${{ vars.PLANE_WORKSPACE_SLUG }}
+    secrets:
+      api_token: ${{ secrets.PLANE_API_TOKEN }}
